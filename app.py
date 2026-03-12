@@ -5,6 +5,7 @@ import importlib
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -79,6 +80,20 @@ def configure_logging() -> logging.Logger:
 
 
 LOGGER = configure_logging()
+MISSING_SHARED_LIBRARY_RE = re.compile(
+    r"error while loading shared libraries: ([^:\n]+): cannot open shared object file"
+)
+
+SHARED_LIBRARY_HINTS = {
+    "libnspr4.so": [
+        "Debian/Ubuntu 系: apt-get update && apt-get install -y libnspr4 libnss3",
+        "Alpine 系: apk add --no-cache nspr nss",
+    ],
+    "libnss3.so": [
+        "Debian/Ubuntu 系: apt-get update && apt-get install -y libnss3 libnspr4",
+        "Alpine 系: apk add --no-cache nss nspr",
+    ],
+}
 
 RUNTIME_REQUIREMENTS = {
     "quart": "quart>=0.19,<1.0",
@@ -122,6 +137,47 @@ def run_logged_subprocess(
         )
 
     return tail_text
+
+
+def playwright_runtime_present() -> bool:
+    if not PLAYWRIGHT_BROWSERS_DIR.exists():
+        return False
+
+    prefixes = ("chromium-", "chromium_headless_shell-", "ffmpeg-")
+    found = {prefix: False for prefix in prefixes}
+    for child in PLAYWRIGHT_BROWSERS_DIR.iterdir():
+        if not child.is_dir():
+            continue
+        for prefix in prefixes:
+            if child.name.startswith(prefix):
+                found[prefix] = True
+
+    return all(found.values())
+
+
+def diagnose_runtime_error(error_text: str) -> tuple[str, Optional[str]]:
+    match = MISSING_SHARED_LIBRARY_RE.search(error_text)
+    if not match:
+        return error_text, None
+
+    library_name = match.group(1)
+    hints = SHARED_LIBRARY_HINTS.get(
+        library_name,
+        [
+            f"Debian/Ubuntu 系: apt-get update && apt-get install -y {library_name}",
+            f"Alpine 系: apk add --no-cache <{library_name} を含むパッケージ>",
+        ],
+    )
+    hint_text = "\n".join(f"- {hint}" for hint in hints)
+    message = (
+        f"Chromium の起動に必要な共有ライブラリが不足しています: {library_name}\n"
+        "この問題は Python コードだけでは解決できず、コンテナイメージ側に OS パッケージの追加が必要です。\n"
+        "例:\n"
+        f"{hint_text}\n\n"
+        "---- 元のエラー ----\n"
+        f"{error_text}"
+    )
+    return message, library_name
 
 
 def ensure_runtime_dependencies() -> None:
@@ -316,6 +372,8 @@ class BrowserManager:
         self.installing = False
         self.last_interaction_at = time.monotonic()
         self.screencast_mode = "idle"
+        self.blocked_error = ""
+        self.missing_shared_library: Optional[str] = None
 
     def status(self) -> dict[str, Any]:
         return {
@@ -334,6 +392,8 @@ class BrowserManager:
             "log_path": str(LOG_FILE),
             "temp_dir": str(TEMP_DIR),
             "cache_dir": str(CACHE_DIR),
+            "blocked_error": self.blocked_error,
+            "missing_shared_library": self.missing_shared_library,
         }
 
     def touch(self) -> None:
@@ -347,6 +407,12 @@ class BrowserManager:
         self.installing = True
         self.install_log = ""
         self.state = "installing"
+
+        if playwright_runtime_present():
+            LOGGER.info("Chromium runtime already present; skipping download")
+            self.installing = False
+            return
+
         LOGGER.info("Ensuring Chromium runtime is installed")
 
         cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
@@ -381,14 +447,22 @@ class BrowserManager:
             )
         LOGGER.info("Chromium runtime is ready")
 
-    async def ensure_started(self) -> None:
+    async def ensure_started(self, force: bool = False) -> None:
         async with self.start_lock:
             if self.page is not None and self.state in {"running", "installing", "starting"}:
+                return
+
+            if self.blocked_error and not force:
+                LOGGER.warning("Startup is blocked until container dependencies are fixed")
+                self.state = "error"
+                self.last_error = self.blocked_error
                 return
 
             await self._cleanup(keep_error=False, next_state="starting")
             self.warning = ""
             self.last_error = ""
+            self.blocked_error = ""
+            self.missing_shared_library = None
             self.state = "starting"
 
             try:
@@ -443,7 +517,11 @@ class BrowserManager:
                     self.viewport_height,
                 )
             except Exception as exc:
-                self.last_error = self._format_exception(exc)
+                formatted_error = self._format_exception(exc)
+                diagnosed_error, missing_library = diagnose_runtime_error(formatted_error)
+                self.last_error = diagnosed_error
+                self.blocked_error = diagnosed_error if missing_library else ""
+                self.missing_shared_library = missing_library
                 LOGGER.exception("Failed to start Chromium session")
                 await self._cleanup(keep_error=True, next_state="error")
 
@@ -451,7 +529,7 @@ class BrowserManager:
         LOGGER.info("Restarting Chromium session")
         async with self.start_lock:
             await self._cleanup(keep_error=False, next_state="restarting")
-        await self.ensure_started()
+        await self.ensure_started(force=True)
 
     async def stop(self) -> None:
         LOGGER.info("Stopping Chromium session")

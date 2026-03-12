@@ -41,6 +41,13 @@ python app.py
 
 `/tmp` に容量制限がある環境でも、ダウンロードや展開がプロジェクト内ディレクトリを使うようにしています。
 
+Linux コンテナでは、Chromium 起動に必要な **OS 共有ライブラリ** が別途必要です。たとえば `libnspr4.so` や `libnss3.so` が無いと、ブラウザ本体のダウンロードは成功しても起動で失敗します。
+
+- Debian/Ubuntu 系の例: `apt-get update && apt-get install -y libnspr4 libnss3`
+- Alpine 系の例: `apk add --no-cache nspr nss`
+
+不足がある場合は `logs/pymium.log` と `/api/status` の `error` / `missing_shared_library` に診断が出ます。
+
 ## 注意
 
 Python パッケージと Chromium 本体の自動取得は `app.py` が行いますが、**Chromium の OS 共有ライブラリ不足**までは Python だけでは解決できません。もし Chromium 起動に失敗したら、トップ画面のオーバーレイまたは `/api/status` の `error` を確認してください。
