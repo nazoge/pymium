@@ -32,6 +32,7 @@ python app.py
 - `PYMIUM_CACHE_DIR`: キャッシュディレクトリ
 - `PYMIUM_LOG_DIR`: ログディレクトリ
 - `PYMIUM_LOG_LEVEL`: ログレベル
+- `PYMIUM_AUTO_INSTALL_SYSTEM_DEPS`: Linux 共有ライブラリ不足時に Python から自動導入を試みるか（デフォルト `1`）
 
 ## ログと一時ファイル
 
@@ -42,6 +43,8 @@ python app.py
 `/tmp` に容量制限がある環境でも、ダウンロードや展開がプロジェクト内ディレクトリを使うようにしています。
 
 Linux コンテナでは、Chromium 起動に必要な **OS 共有ライブラリ** が別途必要です。たとえば `libnspr4.so` や `libnss3.so` が無いと、ブラウザ本体のダウンロードは成功しても起動で失敗します。
+
+Pymium は不足を検出すると、Python 側から `apt-get` / `apk` / `dnf` / `yum` を使って自動導入を試みます。ただし **パッケージマネージャが存在し、かつ root 権限で動いている場合に限ります**。
 
 - Debian/Ubuntu 系の例: `apt-get update && apt-get install -y libnspr4 libnss3`
 - Alpine 系の例: `apk add --no-cache nspr nss`

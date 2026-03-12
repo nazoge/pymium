@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -95,6 +96,59 @@ SHARED_LIBRARY_HINTS = {
     ],
 }
 
+SYSTEM_PACKAGE_MAP = {
+    "apt-get": {
+        "libnspr4.so": ["libnspr4", "libnss3"],
+        "libnss3.so": ["libnss3", "libnspr4"],
+        "libatk-1.0.so.0": ["libatk1.0-0"],
+        "libatk-bridge-2.0.so.0": ["libatk-bridge2.0-0"],
+        "libatspi.so.0": ["libatspi2.0-0"],
+        "libgtk-3.so.0": ["libgtk-3-0"],
+        "libx11-xcb.so.1": ["libx11-xcb1"],
+        "libxcomposite.so.1": ["libxcomposite1"],
+        "libxdamage.so.1": ["libxdamage1"],
+        "libxfixes.so.3": ["libxfixes3"],
+        "libxrandr.so.2": ["libxrandr2"],
+        "libxkbcommon.so.0": ["libxkbcommon0"],
+        "libgbm.so.1": ["libgbm1"],
+        "libdrm.so.2": ["libdrm2"],
+        "libasound.so.2": ["libasound2"],
+        "libcups.so.2": ["libcups2"],
+        "libpango-1.0.so.0": ["libpango-1.0-0"],
+        "libpangocairo-1.0.so.0": ["libpangocairo-1.0-0"],
+        "libcairo.so.2": ["libcairo2"],
+    },
+    "apk": {
+        "libnspr4.so": ["nspr", "nss"],
+        "libnss3.so": ["nss", "nspr"],
+        "libatk-1.0.so.0": ["atk"],
+        "libatk-bridge-2.0.so.0": ["at-spi2-core"],
+        "libatspi.so.0": ["at-spi2-core"],
+        "libgtk-3.so.0": ["gtk+3.0"],
+        "libx11-xcb.so.1": ["libx11"],
+        "libxcomposite.so.1": ["libxcomposite"],
+        "libxdamage.so.1": ["libxdamage"],
+        "libxfixes.so.3": ["libxfixes"],
+        "libxrandr.so.2": ["libxrandr"],
+        "libxkbcommon.so.0": ["libxkbcommon"],
+        "libgbm.so.1": ["mesa-gbm"],
+        "libdrm.so.2": ["mesa-dri-gallium"],
+        "libasound.so.2": ["alsa-lib"],
+        "libcups.so.2": ["cups-libs"],
+        "libpango-1.0.so.0": ["pango"],
+        "libpangocairo-1.0.so.0": ["pango"],
+        "libcairo.so.2": ["cairo"],
+    },
+    "dnf": {
+        "libnspr4.so": ["nspr", "nss"],
+        "libnss3.so": ["nss", "nspr"],
+    },
+    "yum": {
+        "libnspr4.so": ["nspr", "nss"],
+        "libnss3.so": ["nss", "nspr"],
+    },
+}
+
 RUNTIME_REQUIREMENTS = {
     "quart": "quart>=0.19,<1.0",
     "playwright": "playwright>=1.52,<2.0",
@@ -143,16 +197,58 @@ def playwright_runtime_present() -> bool:
     if not PLAYWRIGHT_BROWSERS_DIR.exists():
         return False
 
-    prefixes = ("chromium-", "chromium_headless_shell-", "ffmpeg-")
-    found = {prefix: False for prefix in prefixes}
     for child in PLAYWRIGHT_BROWSERS_DIR.iterdir():
         if not child.is_dir():
             continue
-        for prefix in prefixes:
-            if child.name.startswith(prefix):
-                found[prefix] = True
+        if child.name.startswith(("chromium-", "chromium_headless_shell-")):
+            return True
 
-    return all(found.values())
+    return False
+
+
+def detect_package_manager() -> Optional[str]:
+    for command in ("apt-get", "apk", "dnf", "yum"):
+        if shutil.which(command):
+            return command
+    return None
+
+
+async def run_logged_async_subprocess(
+    command: list[str],
+    *,
+    cwd: Optional[Path] = None,
+    env: Optional[dict[str, str]] = None,
+    log_prefix: str = "subprocess",
+) -> str:
+    LOGGER.info("Running %s command: %s", log_prefix, " ".join(command))
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        cwd=str(cwd) if cwd else None,
+        env=env,
+    )
+
+    output: list[str] = []
+    assert process.stdout is not None
+    while True:
+        line = await process.stdout.readline()
+        if not line:
+            break
+        decoded = line.decode("utf-8", errors="ignore")
+        output.append(decoded)
+        stripped = decoded.rstrip()
+        if stripped:
+            LOGGER.info("[%s] %s", log_prefix, stripped)
+
+    return_code = await process.wait()
+    tail_text = "".join(output[-200:])
+    if return_code != 0:
+        raise RuntimeError(
+            f"{log_prefix} command failed with exit code {return_code}: {' '.join(command)}\n\n{tail_text}"
+        )
+
+    return tail_text
 
 
 def diagnose_runtime_error(error_text: str) -> tuple[str, Optional[str]]:
@@ -161,6 +257,8 @@ def diagnose_runtime_error(error_text: str) -> tuple[str, Optional[str]]:
         return error_text, None
 
     library_name = match.group(1)
+    package_manager = detect_package_manager()
+    package_candidates = SYSTEM_PACKAGE_MAP.get(package_manager or "", {}).get(library_name, [])
     hints = SHARED_LIBRARY_HINTS.get(
         library_name,
         [
@@ -169,9 +267,15 @@ def diagnose_runtime_error(error_text: str) -> tuple[str, Optional[str]]:
         ],
     )
     hint_text = "\n".join(f"- {hint}" for hint in hints)
+    auto_install_text = (
+        f"Pymium は Python 側から {package_manager} で自動導入を試みます: {' '.join(package_candidates)}"
+        if package_manager and package_candidates
+        else "Pymium は Python 側から自動導入を試みられる場合がありますが、対応するパッケージマネージャを判定できませんでした。"
+    )
     message = (
         f"Chromium の起動に必要な共有ライブラリが不足しています: {library_name}\n"
-        "この問題は Python コードだけでは解決できず、コンテナイメージ側に OS パッケージの追加が必要です。\n"
+        f"{auto_install_text}\n"
+        "ただし自動導入には root 権限と OS パッケージマネージャが必要です。\n"
         "例:\n"
         f"{hint_text}\n\n"
         "---- 元のエラー ----\n"
@@ -225,6 +329,12 @@ ACTIVE_FPS = float(os.environ.get("ACTIVE_FPS", "24"))
 IDLE_FPS = float(os.environ.get("IDLE_FPS", "5"))
 ACTIVE_JPEG_QUALITY = int(os.environ.get("ACTIVE_JPEG_QUALITY", "80"))
 IDLE_JPEG_QUALITY = int(os.environ.get("IDLE_JPEG_QUALITY", "62"))
+AUTO_INSTALL_SYSTEM_DEPS = os.environ.get("PYMIUM_AUTO_INSTALL_SYSTEM_DEPS", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 
 
 def normalize_url(raw: str) -> str:
@@ -374,6 +484,11 @@ class BrowserManager:
         self.screencast_mode = "idle"
         self.blocked_error = ""
         self.missing_shared_library: Optional[str] = None
+        self.system_package_manager = detect_package_manager()
+        self.auto_install_system_deps = AUTO_INSTALL_SYSTEM_DEPS
+        self.system_dependency_attempted: set[str] = set()
+        self.system_dependency_log = ""
+        self.apt_updated = False
 
     def status(self) -> dict[str, Any]:
         return {
@@ -394,6 +509,9 @@ class BrowserManager:
             "cache_dir": str(CACHE_DIR),
             "blocked_error": self.blocked_error,
             "missing_shared_library": self.missing_shared_library,
+            "system_package_manager": self.system_package_manager,
+            "auto_install_system_deps": self.auto_install_system_deps,
+            "system_dependency_log": self.system_dependency_log[-4000:],
         }
 
     def touch(self) -> None:
@@ -402,6 +520,108 @@ class BrowserManager:
     def _handle_frame_navigated(self, frame: Any) -> None:
         if self.page is not None and frame == self.page.main_frame:
             self.current_url = frame.url
+
+    def _packages_for_library(self, library_name: str) -> list[str]:
+        if not self.system_package_manager:
+            return []
+        return SYSTEM_PACKAGE_MAP.get(self.system_package_manager, {}).get(library_name, [])
+
+    async def _install_system_packages(self, packages: list[str]) -> str:
+        env = os.environ.copy()
+        manager = self.system_package_manager
+        assert manager is not None
+
+        collected_output: list[str] = []
+        if manager == "apt-get":
+            if not self.apt_updated:
+                collected_output.append(
+                    await run_logged_async_subprocess(
+                        ["apt-get", "update"],
+                        env=env,
+                        log_prefix="apt-update",
+                    )
+                )
+                self.apt_updated = True
+            collected_output.append(
+                await run_logged_async_subprocess(
+                    ["apt-get", "install", "-y", "--no-install-recommends", *packages],
+                    env=env,
+                    log_prefix="apt-install",
+                )
+            )
+        elif manager == "apk":
+            collected_output.append(
+                await run_logged_async_subprocess(
+                    ["apk", "add", "--no-cache", *packages],
+                    env=env,
+                    log_prefix="apk-add",
+                )
+            )
+        elif manager == "dnf":
+            collected_output.append(
+                await run_logged_async_subprocess(
+                    ["dnf", "install", "-y", *packages],
+                    env=env,
+                    log_prefix="dnf-install",
+                )
+            )
+        elif manager == "yum":
+            collected_output.append(
+                await run_logged_async_subprocess(
+                    ["yum", "install", "-y", *packages],
+                    env=env,
+                    log_prefix="yum-install",
+                )
+            )
+        else:
+            raise RuntimeError(f"Unsupported package manager: {manager}")
+
+        return "\n".join(part for part in collected_output if part)
+
+    async def _auto_install_system_dependency(self, library_name: str) -> tuple[bool, str]:
+        if not self.auto_install_system_deps:
+            return False, "PYMIUM_AUTO_INSTALL_SYSTEM_DEPS=0 のため自動導入は無効です。"
+
+        if library_name in self.system_dependency_attempted:
+            return False, f"{library_name} の自動導入は既に試行済みです。"
+
+        if not self.system_package_manager:
+            return False, "対応する OS パッケージマネージャを検出できませんでした。"
+
+        packages = self._packages_for_library(library_name)
+        if not packages:
+            return False, f"{library_name} に対応する自動導入パッケージが未定義です。"
+
+        if hasattr(os, "geteuid") and os.geteuid() != 0:
+            return False, "OS パッケージの自動導入には root 権限が必要ですが、現在のプロセスは root ではありません。"
+
+        self.system_dependency_attempted.add(library_name)
+        self.installing = True
+        self.state = "installing-system-deps"
+        try:
+            LOGGER.info(
+                "Attempting to auto-install missing shared library %s via %s (%s)",
+                library_name,
+                self.system_package_manager,
+                " ".join(packages),
+            )
+            output = await self._install_system_packages(packages)
+            self.system_dependency_log = output[-12000:]
+            self.install_log = self.system_dependency_log
+            self.warning = (
+                f"不足していた {library_name} に対して OS パッケージを自動導入しました。Chromium を再試行します。"
+            )
+            LOGGER.info("System package install for %s completed", library_name)
+            return True, self.warning
+        except Exception as exc:
+            message = f"{library_name} の自動導入に失敗しました: {exc}"
+            self.system_dependency_log = str(exc)[-12000:]
+            self.install_log = self.system_dependency_log
+            self.warning = message
+            LOGGER.exception(message)
+            return False, message
+        finally:
+            self.installing = False
 
     async def install_browser_runtime(self) -> None:
         self.installing = True
@@ -465,68 +685,84 @@ class BrowserManager:
             self.missing_shared_library = None
             self.state = "starting"
 
-            try:
-                await self.install_browser_runtime()
+            while True:
+                try:
+                    await self.install_browser_runtime()
 
-                self.playwright = await async_playwright().start()
-                launch_args = [
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-background-networking",
-                    "--disable-features=Translate,BackForwardCache",
-                    "--disable-renderer-backgrounding",
-                    "--disable-background-timer-throttling",
-                    "--disable-backgrounding-occluded-windows",
-                    "--autoplay-policy=no-user-gesture-required",
-                    "--no-default-browser-check",
-                    "--no-first-run",
-                    "--hide-scrollbars",
-                    "--mute-audio",
-                    "--password-store=basic",
-                    "--use-mock-keychain",
-                    "--disable-sync",
-                    "--disable-breakpad",
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                ]
+                    self.playwright = await async_playwright().start()
+                    launch_args = [
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                        "--disable-background-networking",
+                        "--disable-features=Translate,BackForwardCache",
+                        "--disable-renderer-backgrounding",
+                        "--disable-background-timer-throttling",
+                        "--disable-backgrounding-occluded-windows",
+                        "--autoplay-policy=no-user-gesture-required",
+                        "--no-default-browser-check",
+                        "--no-first-run",
+                        "--hide-scrollbars",
+                        "--mute-audio",
+                        "--password-store=basic",
+                        "--use-mock-keychain",
+                        "--disable-sync",
+                        "--disable-breakpad",
+                        "--no-sandbox",
+                        "--disable-setuid-sandbox",
+                    ]
 
-                self.browser = await self.playwright.chromium.launch(
-                    headless=True,
-                    args=launch_args,
-                )
-                self.context = await self.browser.new_context(
-                    viewport={
-                        "width": self.viewport_width,
-                        "height": self.viewport_height,
-                    },
-                    device_scale_factor=1,
-                    ignore_https_errors=True,
-                )
-                self.page = await self.context.new_page()
-                self.page.on("framenavigated", self._handle_frame_navigated)
-                self.page.set_default_navigation_timeout(45000)
-                await self.page.goto(self.current_url, wait_until="domcontentloaded")
-                self.current_url = self.page.url
-                self.touch()
-                await self._start_capture()
-                self.state = "running"
-                LOGGER.info(
-                    "Chromium started successfully at %s with viewport %sx%s",
-                    self.current_url,
-                    self.viewport_width,
-                    self.viewport_height,
-                )
-            except Exception as exc:
-                formatted_error = self._format_exception(exc)
-                diagnosed_error, missing_library = diagnose_runtime_error(formatted_error)
-                self.last_error = diagnosed_error
-                self.blocked_error = diagnosed_error if missing_library else ""
-                self.missing_shared_library = missing_library
-                LOGGER.exception("Failed to start Chromium session")
-                await self._cleanup(keep_error=True, next_state="error")
+                    self.browser = await self.playwright.chromium.launch(
+                        headless=True,
+                        args=launch_args,
+                    )
+                    self.context = await self.browser.new_context(
+                        viewport={
+                            "width": self.viewport_width,
+                            "height": self.viewport_height,
+                        },
+                        device_scale_factor=1,
+                        ignore_https_errors=True,
+                    )
+                    self.page = await self.context.new_page()
+                    self.page.on("framenavigated", self._handle_frame_navigated)
+                    self.page.set_default_navigation_timeout(45000)
+                    await self.page.goto(self.current_url, wait_until="domcontentloaded")
+                    self.current_url = self.page.url
+                    self.touch()
+                    await self._start_capture()
+                    self.state = "running"
+                    LOGGER.info(
+                        "Chromium started successfully at %s with viewport %sx%s",
+                        self.current_url,
+                        self.viewport_width,
+                        self.viewport_height,
+                    )
+                    return
+                except Exception as exc:
+                    formatted_error = self._format_exception(exc)
+                    diagnosed_error, missing_library = diagnose_runtime_error(formatted_error)
+                    LOGGER.exception("Failed to start Chromium session")
+                    await self._cleanup(keep_error=True, next_state="error")
+
+                    self.last_error = diagnosed_error
+                    self.missing_shared_library = missing_library
+                    if missing_library:
+                        installed, auto_message = await self._auto_install_system_dependency(missing_library)
+                        if installed:
+                            self.last_error = ""
+                            self.blocked_error = ""
+                            self.missing_shared_library = None
+                            self.state = "starting"
+                            continue
+
+                        if auto_message:
+                            self.last_error = f"{diagnosed_error}\n\n---- 自動導入結果 ----\n{auto_message}"
+                        self.blocked_error = self.last_error
+                    return
 
     async def restart(self) -> None:
         LOGGER.info("Restarting Chromium session")
+        self.system_dependency_attempted.clear()
         async with self.start_lock:
             await self._cleanup(keep_error=False, next_state="restarting")
         await self.ensure_started(force=True)
