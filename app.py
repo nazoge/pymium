@@ -335,6 +335,7 @@ AUTO_INSTALL_SYSTEM_DEPS = os.environ.get("PYMIUM_AUTO_INSTALL_SYSTEM_DEPS", "1"
     "no",
     "off",
 }
+IS_LINUX = sys.platform.startswith("linux")
 
 
 def normalize_url(raw: str) -> str:
@@ -489,6 +490,8 @@ class BrowserManager:
         self.system_dependency_attempted: set[str] = set()
         self.system_dependency_log = ""
         self.apt_updated = False
+        self.blocked_warning_emitted = False
+        self.playwright_deps_bootstrap_attempted = False
 
     def status(self) -> dict[str, Any]:
         return {
@@ -578,22 +581,65 @@ class BrowserManager:
 
         return "\n".join(part for part in collected_output if part)
 
+    async def _maybe_install_playwright_system_dependencies(self) -> None:
+        if not IS_LINUX:
+            return
+        if not self.auto_install_system_deps:
+            return
+        if self.playwright_deps_bootstrap_attempted:
+            return
+        if self.system_package_manager != "apt-get":
+            return
+        if hasattr(os, "geteuid") and os.geteuid() != 0:
+            LOGGER.warning("Skipping playwright install-deps because root 権限がありません")
+            return
+
+        self.playwright_deps_bootstrap_attempted = True
+        self.installing = True
+        self.state = "installing-system-deps"
+        try:
+            LOGGER.info("Running playwright install-deps chromium")
+            output = await run_logged_async_subprocess(
+                [sys.executable, "-m", "playwright", "install-deps", "chromium"],
+                cwd=BASE_DIR,
+                env=os.environ.copy(),
+                log_prefix="playwright-install-deps",
+            )
+            self.system_dependency_log = output[-12000:]
+            self.install_log = self.system_dependency_log
+        except Exception as exc:
+            self.system_dependency_log = str(exc)[-12000:]
+            self.install_log = self.system_dependency_log
+            LOGGER.warning("playwright install-deps failed; will continue with targeted fallback", exc_info=exc)
+        finally:
+            self.installing = False
+
     async def _auto_install_system_dependency(self, library_name: str) -> tuple[bool, str]:
         if not self.auto_install_system_deps:
-            return False, "PYMIUM_AUTO_INSTALL_SYSTEM_DEPS=0 のため自動導入は無効です。"
+            message = "PYMIUM_AUTO_INSTALL_SYSTEM_DEPS=0 のため自動導入は無効です。"
+            LOGGER.warning(message)
+            return False, message
 
         if library_name in self.system_dependency_attempted:
-            return False, f"{library_name} の自動導入は既に試行済みです。"
+            message = f"{library_name} の自動導入は既に試行済みです。"
+            LOGGER.warning(message)
+            return False, message
 
         if not self.system_package_manager:
-            return False, "対応する OS パッケージマネージャを検出できませんでした。"
+            message = "対応する OS パッケージマネージャを検出できませんでした。"
+            LOGGER.warning(message)
+            return False, message
 
         packages = self._packages_for_library(library_name)
         if not packages:
-            return False, f"{library_name} に対応する自動導入パッケージが未定義です。"
+            message = f"{library_name} に対応する自動導入パッケージが未定義です。"
+            LOGGER.warning(message)
+            return False, message
 
         if hasattr(os, "geteuid") and os.geteuid() != 0:
-            return False, "OS パッケージの自動導入には root 権限が必要ですが、現在のプロセスは root ではありません。"
+            message = "OS パッケージの自動導入には root 権限が必要ですが、現在のプロセスは root ではありません。"
+            LOGGER.warning(message)
+            return False, message
 
         self.system_dependency_attempted.add(library_name)
         self.installing = True
@@ -673,7 +719,9 @@ class BrowserManager:
                 return
 
             if self.blocked_error and not force:
-                LOGGER.warning("Startup is blocked until container dependencies are fixed")
+                if not self.blocked_warning_emitted:
+                    LOGGER.warning("Startup is blocked until container dependencies are fixed")
+                    self.blocked_warning_emitted = True
                 self.state = "error"
                 self.last_error = self.blocked_error
                 return
@@ -682,12 +730,14 @@ class BrowserManager:
             self.warning = ""
             self.last_error = ""
             self.blocked_error = ""
+            self.blocked_warning_emitted = False
             self.missing_shared_library = None
             self.state = "starting"
 
             while True:
                 try:
                     await self.install_browser_runtime()
+                    await self._maybe_install_playwright_system_dependencies()
 
                     self.playwright = await async_playwright().start()
                     launch_args = [
@@ -758,11 +808,13 @@ class BrowserManager:
                         if auto_message:
                             self.last_error = f"{diagnosed_error}\n\n---- 自動導入結果 ----\n{auto_message}"
                         self.blocked_error = self.last_error
+                        self.blocked_warning_emitted = False
                     return
 
     async def restart(self) -> None:
         LOGGER.info("Restarting Chromium session")
         self.system_dependency_attempted.clear()
+        self.blocked_warning_emitted = False
         async with self.start_lock:
             await self._cleanup(keep_error=False, next_state="restarting")
         await self.ensure_started(force=True)
