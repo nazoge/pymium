@@ -97,6 +97,35 @@ SHARED_LIBRARY_HINTS = {
     ],
 }
 
+ROOTLESS_DEBIAN_COMMON_PACKAGES = [
+    "libasound2",
+    "libatk-bridge2.0-0",
+    "libatk1.0-0",
+    "libatspi2.0-0",
+    "libcairo2",
+    "libcups2",
+    "libdbus-1-3",
+    "libdrm2",
+    "libgbm1",
+    "libglib2.0-0",
+    "libgtk-3-0",
+    "libnspr4",
+    "libnss3",
+    "libpango-1.0-0",
+    "libpangocairo-1.0-0",
+    "libx11-6",
+    "libx11-xcb1",
+    "libxcb1",
+    "libxcomposite1",
+    "libxdamage1",
+    "libxext6",
+    "libxfixes3",
+    "libxkbcommon0",
+    "libxrandr2",
+    "libxrender1",
+    "libxshmfence1",
+]
+
 SYSTEM_PACKAGE_MAP = {
     "apt-get": {
         "libnspr4.so": ["libnspr4", "libnss3"],
@@ -258,10 +287,11 @@ def diagnose_runtime_error(error_text: str) -> tuple[str, Optional[str]]:
         return error_text, None
 
     library_name = match.group(1)
+    normalized_library_name = library_name.lower()
     package_manager = detect_package_manager()
-    package_candidates = SYSTEM_PACKAGE_MAP.get(package_manager or "", {}).get(library_name, [])
+    package_candidates = SYSTEM_PACKAGE_MAP.get(package_manager or "", {}).get(normalized_library_name, [])
     hints = SHARED_LIBRARY_HINTS.get(
-        library_name,
+        normalized_library_name,
         [
             f"Debian/Ubuntu 系: apt-get update && apt-get install -y {library_name}",
             f"Alpine 系: apk add --no-cache <{library_name} を含むパッケージ>",
@@ -376,8 +406,9 @@ prepend_library_dirs_to_env(discover_shared_library_dirs(LOCAL_LIBS_DIR))
 
 
 def library_exists_in_local_bundle(library_name: str) -> bool:
+    target = library_name.lower()
     for root, _, files in os.walk(LOCAL_LIBS_DIR):
-        if library_name in files:
+        if any(file_name.lower() == target for file_name in files):
             return True
     return False
 
@@ -572,7 +603,7 @@ class BrowserManager:
     def _packages_for_library(self, library_name: str) -> list[str]:
         if not self.system_package_manager:
             return []
-        return SYSTEM_PACKAGE_MAP.get(self.system_package_manager, {}).get(library_name, [])
+        return SYSTEM_PACKAGE_MAP.get(self.system_package_manager, {}).get(library_name.lower(), [])
 
     async def _install_system_packages(self, packages: list[str]) -> str:
         env = os.environ.copy()
@@ -632,6 +663,8 @@ class BrowserManager:
         if not apt_command or not dpkg_deb:
             raise RuntimeError("root不要の Debian パッケージ展開に必要な apt と dpkg-deb が見つかりません。")
 
+        package_list = list(dict.fromkeys([*packages, *ROOTLESS_DEBIAN_COMMON_PACKAGES]))
+
         download_dir = CACHE_DIR / "apt-downloads"
         download_dir.mkdir(parents=True, exist_ok=True)
 
@@ -640,14 +673,14 @@ class BrowserManager:
 
         collected_output = [
             await run_logged_async_subprocess(
-                [apt_command, "download", *packages],
+                [apt_command, "download", *package_list],
                 cwd=download_dir,
                 env=env,
                 log_prefix="apt-download",
             )
         ]
 
-        for package in packages:
+        for package in package_list:
             candidates = sorted(download_dir.glob(f"{package}_*.deb"), key=lambda item: item.stat().st_mtime)
             if not candidates:
                 raise RuntimeError(f"{package} の .deb ファイルを取得できませんでした。")
